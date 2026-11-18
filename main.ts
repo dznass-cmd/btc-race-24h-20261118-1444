@@ -1,5 +1,10 @@
 import { BPS, runBars, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
+/** Bot identification and strategy descriptor */
+export const BOT_NAME = 'Dual-EMA-Hysteresis-cbBTC';
+export const BOT_VERSION = '1.0.0';
+export const STRATEGY_TYPE = 'Trend-Following';
+
 const FAST_SPAN = 14;
 const SLOW_SPAN = 55;
 const ENTER_HYST_BPS = 14;
@@ -27,6 +32,11 @@ function stepEma(e: Ema, close: number): void {
   if (e.warm.length === e.span) {
     e.value = e.warm.reduce((a, b) => a + b, 0) / e.span;
   }
+}
+
+/** Computes upper or lower threshold price given basis points offset */
+function applyBpsOffset(price: number, bpsOffset: number): number {
+  return price * (1 + bpsOffset / 10000);
 }
 
 const fastEma: Ema = { span: FAST_SPAN, warm: [], value: null };
@@ -88,20 +98,20 @@ await runBars({
         highestPrice = close;
       }
 
-      if (!tpArmed && highestPrice >= entryPrice * (1 + TP_TRIGGER_BPS / 10000)) {
+      if (!tpArmed && highestPrice >= applyBpsOffset(entryPrice, TP_TRIGGER_BPS)) {
         tpArmed = true;
       }
 
       let exitReason: string | null = null;
 
-      if (close <= entryPrice * (1 - STOP_LOSS_BPS / 10000)) {
+      if (close <= applyBpsOffset(entryPrice, -STOP_LOSS_BPS)) {
         exitReason = 'stop_loss';
-      } else if (tpArmed && close <= highestPrice * (1 - TP_TRAILING_BPS / 10000)) {
+      } else if (tpArmed && close <= applyBpsOffset(highestPrice, -TP_TRAILING_BPS)) {
         exitReason = 'trailing_tp';
       } else if (
         fastEma.value !== null &&
         slowEma.value !== null &&
-        fastEma.value < slowEma.value * (1 - EXIT_HYST_BPS / 10000)
+        fastEma.value < applyBpsOffset(slowEma.value, -EXIT_HYST_BPS)
       ) {
         exitReason = 'trend_reversal';
       }
@@ -131,8 +141,8 @@ await runBars({
       prevFast !== null &&
       prevSlow !== null
     ) {
-      const isAbove = fastEma.value > slowEma.value * (1 + ENTER_HYST_BPS / 10000);
-      const wasAbove = prevFast > prevSlow * (1 + ENTER_HYST_BPS / 10000);
+      const isAbove = fastEma.value > applyBpsOffset(slowEma.value, ENTER_HYST_BPS);
+      const wasAbove = prevFast > applyBpsOffset(prevSlow, ENTER_HYST_BPS);
 
       if (isAbove && !wasAbove) {
         const { caps, fees } = state.hello;
