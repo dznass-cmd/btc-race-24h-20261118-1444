@@ -1,172 +1,289 @@
 import { BPS, runBars, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-/** Bot identification and strategy descriptor */
+/**
+ * Strategy identification metadata for race scoring, leaderboard provenance,
+ * and harness telemetry introspection.
+ */
 export const BOT_NAME = 'Dual-EMA-Hysteresis-cbBTC';
-export const BOT_VERSION = '1.0.0';
-export const STRATEGY_TYPE = 'Trend-Following';
+export const BOT_VERSION = '2.0.0';
+export const STRATEGY_TYPE = 'Quantitative-Trend-Following';
 
-const FAST_SPAN = 14;
-const SLOW_SPAN = 55;
-const ENTER_HYST_BPS = 14;
-const EXIT_HYST_BPS = 8;
-const STOP_LOSS_BPS = 150;
-const TP_TRIGGER_BPS = 80;
-const TP_TRAILING_BPS = 28;
-const COOLDOWN_BARS = 30;
-const MAX_SLIPPAGE_BPS = 150;
-const MIN_STABILIZATION_BARS = 120;
-const MAX_ENTRY_BAR = 1200;
-
-interface Ema {
-  span: number;
-  warm: number[];
+/**
+ * State container for an Exponential Moving Average (EMA).
+ * Tracks historical warm-up samples before switching to continuous recursive exponential smoothing.
+ */
+export interface EmaState {
+  readonly span: number;
+  readonly warm: number[];
   value: number | null;
 }
 
-function stepEma(e: Ema, close: number): void {
-  if (e.value !== null) {
-    e.value += (2 / (e.span + 1)) * (close - e.value);
-    return;
+/**
+ * Encapsulated Object-Oriented Trend-Following Strategy for cbBTC/USDC on Base (1-minute bars).
+ *
+ * Microstructure & Algorithmic Formulation:
+ * 1. Dual EMA Filter:
+ *    Maintains a fast smoothing span (14 bars) and a slow baseline span (55 bars).
+ *    During initialization, an arithmetic mean warms up the accumulator. Once warmed,
+ *    recursive smoothing applies: EMA_t = EMA_{t-1} + (2 / (span + 1)) * (Close_t - EMA_{t-1}).
+ *
+ * 2. Asymmetric Hysteresis Band (Schmitt Trigger):
+ *    Standard moving average crossovers are susceptible to high-frequency whipsaws during
+ *    consolidation regimes. To suppress false signals:
+ *    - Long Entry requires: Fast_t > Slow_t * (1 + 14 bps) with prior bar Fast_{t-1} <= Slow_{t-1} * (1 + 14 bps).
+ *    - Reversal Exit requires: Fast_t < Slow_t * (1 - 8 bps).
+ *
+ * 3. Dynamic High-Watermark Trailing Profit Stop:
+ *    - Armed when unrealized profit reaches +80 bps from the execution entry price.
+ *    - Once armed, monitors peak price: P_peak = max(P_peak, Close_t).
+ *    - Triggers protective exit if price retraces 28 bps from the recorded peak.
+ *
+ * 4. Capital Protection Guardrails:
+ *    - Hard Stop Loss: -150 bps from fill price.
+ *    - Stabilization: No entries permitted during the first 120 bars to ensure moving average stability.
+ *    - Session Cutoff: No entries permitted after bar 1200 to prevent unhedged holding into settlement.
+ *    - Post-Trade Cooldown: Enforces a 30-bar quiet period after every position liquidation.
+ */
+export class BtcTrendStrategy {
+  // Algorithmic Hyperparameters
+  public readonly fastSpan: number = 14;
+  public readonly slowSpan: number = 55;
+  public readonly enterHysteresisBps: number = 14;
+  public readonly exitHysteresisBps: number = 8;
+  public readonly stopLossBps: number = 150;
+  public readonly tpTriggerBps: number = 80;
+  public readonly tpTrailingBps: number = 28;
+  public readonly cooldownBars: number = 30;
+  public readonly maxSlippageBps: number = 150;
+  public readonly minStabilizationBars: number = 120;
+  public readonly maxEntryBar: number = 1200;
+
+  // Indicator States
+  public readonly fastEma: EmaState;
+  public readonly slowEma: EmaState;
+  public prevFast: number | null = null;
+  public prevSlow: number | null = null;
+
+  // Execution & Position States
+  public cooldown: number = 0;
+  public entryPrice: number = 0;
+  public highestPrice: number = 0;
+  public tpArmed: boolean = false;
+  public orderPending: 'buy' | 'sell' | null = null;
+
+  constructor() {
+    this.fastEma = { span: this.fastSpan, warm: [], value: null };
+    this.slowEma = { span: this.slowSpan, warm: [], value: null };
   }
-  e.warm.push(close);
-  if (e.warm.length === e.span) {
-    e.value = e.warm.reduce((a, b) => a + b, 0) / e.span;
+
+  /**
+   * Applies an asymmetric basis point offset to a reference price.
+   * @param price Reference base price
+   * @param bpsOffset Basis points delta (positive for upper band, negative for lower band)
+   */
+  public applyBpsOffset(price: number, bpsOffset: number): number {
+    return price * (1 + bpsOffset / 10000);
   }
-}
 
-/** Computes upper or lower threshold price given basis points offset */
-function applyBpsOffset(price: number, bpsOffset: number): number {
-  return price * (1 + bpsOffset / 10000);
-}
-
-const fastEma: Ema = { span: FAST_SPAN, warm: [], value: null };
-const slowEma: Ema = { span: SLOW_SPAN, warm: [], value: null };
-
-let prevFast: number | null = null;
-let prevSlow: number | null = null;
-let cooldown = 0;
-
-let entryPrice = 0;
-let highestPrice = 0;
-let tpArmed = false;
-let orderPending: 'buy' | 'sell' | null = null;
-
-await runBars({
-  onBatch(state, batch) {
-    const symbol = state.hello.symbols[0]?.symbol ?? 'CBBTC';
-    const latestBar = state.latest.get(symbol);
-
-    if (latestBar) {
-      const close = Number(latestBar.c);
-      stepEma(fastEma, close);
-      stepEma(slowEma, close);
+  /**
+   * Updates an EMA state with the latest closing price.
+   * Uses SMA warm-up until the window size is met, then switches to recursive exponential smoothing.
+   */
+  public updateEma(ema: EmaState, close: number): void {
+    if (ema.value !== null) {
+      ema.value += (2 / (ema.span + 1)) * (close - ema.value);
+      return;
     }
+    ema.warm.push(close);
+    if (ema.warm.length === ema.span) {
+      ema.value = ema.warm.reduce((acc, curr) => acc + curr, 0) / ema.span;
+    }
+  }
 
-    for (const fill of batch.fills) {
+  /**
+   * Processes execution fills returned by the market simulator.
+   * Updates cost basis, arms/resets trailing profit monitors, and triggers cooldown counters.
+   */
+  public onFills(fills: readonly any[], symbol: string): void {
+    for (const fill of fills) {
       if (fill.symbol === symbol) {
-        orderPending = null;
+        this.orderPending = null;
         if (fill.status === 'filled') {
           if (fill.side === 'buy') {
-            entryPrice = Number(fill.price);
-            highestPrice = entryPrice;
-            tpArmed = false;
+            this.entryPrice = Number(fill.price);
+            this.highestPrice = this.entryPrice;
+            this.tpArmed = false;
           } else if (fill.side === 'sell') {
-            entryPrice = 0;
-            highestPrice = 0;
-            tpArmed = false;
-            cooldown = COOLDOWN_BARS;
+            this.entryPrice = 0;
+            this.highestPrice = 0;
+            this.tpArmed = false;
+            this.cooldown = this.cooldownBars;
           }
         }
       }
     }
+  }
 
-    if (cooldown > 0) {
-      cooldown--;
+  /**
+   * Evaluates active position against risk exit criteria:
+   * 1. Hard Stop Loss (-150 bps)
+   * 2. High-Watermark Trailing Take-Profit (-28 bps pullback from peak after +80 bps trigger)
+   * 3. Trend Reversal Exit (Fast EMA < Slow EMA - 8 bps)
+   */
+  public evaluateExit(
+    held: { qty: bigint; cost: bigint } | undefined,
+    symbol: string,
+    close: number
+  ): SellInput | null {
+    if (held !== undefined && this.entryPrice === 0 && close > 0) {
+      this.entryPrice = close;
+      this.highestPrice = close;
+      this.tpArmed = false;
     }
 
-    const held = state.positions.get(symbol);
-    const close = latestBar ? Number(latestBar.c) : 0;
-
-    if (held !== undefined && entryPrice === 0 && close > 0) {
-      entryPrice = close;
-      highestPrice = close;
-      tpArmed = false;
-    }
-
-    if (held !== undefined && orderPending === null && entryPrice > 0 && close > 0) {
-      if (close > highestPrice) {
-        highestPrice = close;
+    if (held !== undefined && this.orderPending === null && this.entryPrice > 0 && close > 0) {
+      if (close > this.highestPrice) {
+        this.highestPrice = close;
       }
 
-      if (!tpArmed && highestPrice >= applyBpsOffset(entryPrice, TP_TRIGGER_BPS)) {
-        tpArmed = true;
+      if (!this.tpArmed && this.highestPrice >= this.applyBpsOffset(this.entryPrice, this.tpTriggerBps)) {
+        this.tpArmed = true;
       }
 
       let exitReason: string | null = null;
 
-      if (close <= applyBpsOffset(entryPrice, -STOP_LOSS_BPS)) {
+      if (close <= this.applyBpsOffset(this.entryPrice, -this.stopLossBps)) {
         exitReason = 'stop_loss';
-      } else if (tpArmed && close <= applyBpsOffset(highestPrice, -TP_TRAILING_BPS)) {
+      } else if (this.tpArmed && close <= this.applyBpsOffset(this.highestPrice, -this.tpTrailingBps)) {
         exitReason = 'trailing_tp';
       } else if (
-        fastEma.value !== null &&
-        slowEma.value !== null &&
-        fastEma.value < applyBpsOffset(slowEma.value, -EXIT_HYST_BPS)
+        this.fastEma.value !== null &&
+        this.slowEma.value !== null &&
+        this.fastEma.value < this.applyBpsOffset(this.slowEma.value, -this.exitHysteresisBps)
       ) {
         exitReason = 'trend_reversal';
       }
 
       if (exitReason !== null) {
-        orderPending = 'sell';
-        prevFast = fastEma.value;
-        prevSlow = slowEma.value;
-
-        return [{
+        this.orderPending = 'sell';
+        return {
           side: 'sell',
           symbol,
           qty: held.qty,
-          max_slippage_bps: MAX_SLIPPAGE_BPS,
-        }];
+          max_slippage_bps: this.maxSlippageBps,
+        };
       }
     }
 
+    return null;
+  }
+
+  /**
+   * Evaluates flat cash state for long breakout entry:
+   * Checks stabilization period, session boundaries, post-trade cooldown, and upward hysteresis crossover.
+   */
+  public evaluateEntry(
+    batchSeq: number,
+    equity: bigint,
+    cash: bigint,
+    caps: any,
+    fees: any,
+    symbol: string
+  ): BuyInput | null {
     if (
-      held === undefined &&
-      orderPending === null &&
-      cooldown === 0 &&
-      batch.seq >= MIN_STABILIZATION_BARS &&
-      batch.seq <= MAX_ENTRY_BAR &&
-      fastEma.value !== null &&
-      slowEma.value !== null &&
-      prevFast !== null &&
-      prevSlow !== null
+      this.orderPending === null &&
+      this.cooldown === 0 &&
+      batchSeq >= this.minStabilizationBars &&
+      batchSeq <= this.maxEntryBar &&
+      this.fastEma.value !== null &&
+      this.slowEma.value !== null &&
+      this.prevFast !== null &&
+      this.prevSlow !== null
     ) {
-      const isAbove = fastEma.value > applyBpsOffset(slowEma.value, ENTER_HYST_BPS);
-      const wasAbove = prevFast > applyBpsOffset(prevSlow, ENTER_HYST_BPS);
+      const isAbove = this.fastEma.value > this.applyBpsOffset(this.slowEma.value, this.enterHysteresisBps);
+      const wasAbove = this.prevFast > this.applyBpsOffset(this.prevSlow, this.enterHysteresisBps);
 
       if (isAbove && !wasAbove) {
-        const { caps, fees } = state.hello;
-        const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
-        const slice = state.cash < byWeight ? state.cash : byWeight;
+        const byWeight = (BigInt(caps.max_weight_bps) * equity) / BPS;
+        const slice = cash < byWeight ? cash : byWeight;
 
         if (slice >= BigInt(fees.min_notional_quote_units)) {
-          orderPending = 'buy';
-          prevFast = fastEma.value;
-          prevSlow = slowEma.value;
-
-          return [{
+          this.orderPending = 'buy';
+          return {
             side: 'buy',
             symbol,
             notional_quote_units: slice,
-            max_slippage_bps: MAX_SLIPPAGE_BPS,
-          }];
+            max_slippage_bps: this.maxSlippageBps,
+          };
         }
       }
     }
 
-    prevFast = fastEma.value;
-    prevSlow = slowEma.value;
+    return null;
+  }
+
+  /**
+   * Dispatches 1-minute batch execution logic per bar:
+   * Updates indicator series, handles fills, checks exits, and generates entry orders.
+   */
+  public onBar(state: any, batch: any): readonly (BuyInput | SellInput)[] {
+    const symbol = state.hello.symbols[0]?.symbol ?? 'CBBTC';
+    const latestBar = state.latest.get(symbol);
+
+    if (latestBar) {
+      const close = Number(latestBar.c);
+      this.updateEma(this.fastEma, close);
+      this.updateEma(this.slowEma, close);
+    }
+
+    this.onFills(batch.fills, symbol);
+
+    if (this.cooldown > 0) {
+      this.cooldown--;
+    }
+
+    const held = state.positions.get(symbol);
+    const close = latestBar ? Number(latestBar.c) : 0;
+
+    // 1. Check Exit conditions for active position
+    const exitOrder = this.evaluateExit(held, symbol, close);
+    if (exitOrder) {
+      this.prevFast = this.fastEma.value;
+      this.prevSlow = this.slowEma.value;
+      return [exitOrder];
+    }
+
+    // 2. Check Entry conditions when flat
+    if (held === undefined) {
+      const entryOrder = this.evaluateEntry(
+        batch.seq,
+        state.equity,
+        state.cash,
+        state.hello.caps,
+        state.hello.fees,
+        symbol
+      );
+      if (entryOrder) {
+        this.prevFast = this.fastEma.value;
+        this.prevSlow = this.slowEma.value;
+        return [entryOrder];
+      }
+    }
+
+    // 3. Update previous EMA values for crossover boundary tracking
+    this.prevFast = this.fastEma.value;
+    this.prevSlow = this.slowEma.value;
 
     return [];
+  }
+}
+
+// Strategy instance instantiation
+const strategy = new BtcTrendStrategy();
+
+// Main event loop runner
+await runBars({
+  onBatch(state, batch) {
+    return strategy.onBar(state, batch);
   },
 });
